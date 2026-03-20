@@ -7,8 +7,8 @@ Usage:
     python -m swe_vision.cli --interactive
 
 Environment Variables:
-    OPENAI_API_KEY      - Your OpenAI API key
-    OPENAI_BASE_URL     - (Optional) Custom API base URL
+    OPENAI_API_KEY      - API key for an OpenAI-compatible provider
+    OPENAI_BASE_URL     - (Optional) Custom OpenAI-compatible API base URL
     OPENAI_MODEL        - (Optional) Model name, default: gpt-4o
 """
 
@@ -38,7 +38,7 @@ Examples:
   # Interactive mode
   python -m swe_vision.cli --interactive
 
-  # Custom model and API
+  # Custom model and OpenAI-compatible API
   python -m swe_vision.cli --model gpt-4o --base-url https://api.openai.com/v1 "Hello"
         """,
     )
@@ -67,12 +67,12 @@ Examples:
     parser.add_argument(
         "--api-key",
         default=None,
-        help="OpenAI API key (or set OPENAI_API_KEY env var)",
+        help="API key for an OpenAI-compatible provider (or set OPENAI_API_KEY env var)",
     )
     parser.add_argument(
         "--base-url",
         default=None,
-        help="Custom API base URL (or set OPENAI_BASE_URL env var)",
+        help="Custom OpenAI-compatible API base URL (or set OPENAI_BASE_URL env var)",
     )
     parser.add_argument(
         "--max-iterations",

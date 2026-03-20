@@ -31,7 +31,7 @@ from swe_vision.trajectory import TrajectoryRecorder
 
 class VLMToolCallAgent:
     """
-    An agentic VLM framework that uses OpenAI's function calling to
+    An agentic VLM framework that uses OpenAI-compatible function calling to
     give a vision-language model access to a stateful Jupyter notebook
     running inside a Docker container.
     """
@@ -65,9 +65,10 @@ class VLMToolCallAgent:
 
         self.client = OpenAI(**client_kwargs)
 
-        print(f"Using model: {self.model}")
-        print(f"Using API key: {api_key}")
-        print(f"Using base URL: {base_url}")
+        if self.verbose:
+            print(f"Using model: {self.model}")
+            print(f"Using API key: {api_key}")
+            print(f"Using base URL: {base_url}")
 
         self.kernel: Optional[JupyterNotebookKernel] = None
         self.file_manager = NotebookFileManager()
@@ -136,10 +137,10 @@ class VLMToolCallAgent:
             tool_choice="auto",
         )
         if self.reasoning:
-            kwargs["extra_body"] = {"reasoning": {"enabled": True, 'effort': 'xhigh'}}
-            kwargs["reasoning_effort"] = 'xhigh'
+            kwargs["extra_body"] = {"reasoning": {"enabled": True, "effort": "high"}}
+            kwargs["reasoning_effort"] = "high"
         else:
-            kwargs["extra_body"] = {"reasoning": {"enabled": False, 'effort': 'minimal'}}
+            kwargs["extra_body"] = {"reasoning": {"enabled": False, "effort": "none"}}
 
         response = self.client.chat.completions.create(**kwargs)
         return response
@@ -229,15 +230,17 @@ class VLMToolCallAgent:
                 print(f"\n--- Iteration {iteration}/{self.max_iterations} ---")
 
             MAX_RETRIES = 10
+            last_error: Optional[Exception] = None
             for retry in range(MAX_RETRIES):
                 try:
                     response = self._call_llm()
                     break
                 except Exception as e:
-                    self._log("OpenAI API error: %s, retry %d/%d", str(e), retry, MAX_RETRIES, level="error")
+                    last_error = e
+                    self._log("LLM API error: %s, retry %d/%d", str(e), retry, MAX_RETRIES, level="error")
 
-            if retry == MAX_RETRIES - 1:
-                return f"[Error] Failed to call LLM: {e}"
+            if last_error is not None and retry == MAX_RETRIES - 1:
+                return f"[Error] Failed to call LLM: {last_error}"
 
             choice = response.choices[0]
             message = choice.message
@@ -275,8 +278,8 @@ class VLMToolCallAgent:
 
             if not message.tool_calls:
                 if choice.finish_reason == "stop":
-                    self._log("Model stopped without calling finish tool.")
-                    return message.content or "[No response]"
+                    self._log("Model stopped without calling finish tool.", level="error")
+                    return "[Error] Model stopped without calling finish tool."
                 continue
 
             for tool_call in message.tool_calls:
