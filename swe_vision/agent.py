@@ -11,6 +11,7 @@ The agent loop:
 import datetime
 import json
 import os
+import re
 import traceback
 from typing import Any, Dict, List, Optional
 
@@ -31,7 +32,7 @@ from swe_vision.trajectory import TrajectoryRecorder
 
 class VLMToolCallAgent:
     """
-    An agentic VLM framework that uses OpenAI's function calling to
+    An agentic VLM framework that uses OpenAI-compatible function calling to
     give a vision-language model access to a stateful Jupyter notebook
     running inside a Docker container.
     """
@@ -65,9 +66,10 @@ class VLMToolCallAgent:
 
         self.client = OpenAI(**client_kwargs)
 
-        print(f"Using model: {self.model}")
-        print(f"Using API key: {api_key}")
-        print(f"Using base URL: {base_url}")
+        if self.verbose:
+            print(f"Using model: {self.model}")
+            print(f"Using API key: {api_key}")
+            print(f"Using base URL: {base_url}")
 
         self.kernel: Optional[JupyterNotebookKernel] = None
         self.file_manager = NotebookFileManager()
@@ -75,6 +77,7 @@ class VLMToolCallAgent:
         self.messages: List[Dict[str, Any]] = []
 
         self.trajectory: Optional[TrajectoryRecorder] = None
+        self._uploaded_image_paths: List[str] = []
 
     async def _ensure_kernel(self):
         if self.kernel is None:
@@ -128,18 +131,18 @@ class VLMToolCallAgent:
 
         return {"role": "user", "content": content}
 
-    def _call_llm(self) -> Any:
+    def _call_llm(self, tool_choice: Any = "auto") -> Any:
         kwargs = dict(
             model=self.model,
             messages=self.messages,
             tools=TOOLS,
-            tool_choice="auto",
+            tool_choice=tool_choice,
         )
         if self.reasoning:
-            kwargs["extra_body"] = {"reasoning": {"enabled": True, 'effort': 'xhigh'}}
-            kwargs["reasoning_effort"] = 'xhigh'
+            kwargs["extra_body"] = {"reasoning": {"enabled": True, "effort": "high"}}
+            kwargs["reasoning_effort"] = "high"
         else:
-            kwargs["extra_body"] = {"reasoning": {"enabled": False, 'effort': 'minimal'}}
+            kwargs["extra_body"] = {"reasoning": {"enabled": False, "effort": "none"}}
 
         response = self.client.chat.completions.create(**kwargs)
         return response
@@ -194,6 +197,7 @@ class VLMToolCallAgent:
         Returns the final answer string.
         """
         self.trajectory = self._init_trajectory(query, image_paths)
+        self._uploaded_image_paths = list(image_paths or [])
 
         self.messages = [
             {"role": "system", "content": self.system_prompt},
@@ -224,20 +228,31 @@ class VLMToolCallAgent:
 
     async def _run_loop(self) -> str:
         """Core agentic loop."""
+        tool_calls_seen = 0
+        pending_tool_correction = False
+
         for iteration in range(1, self.max_iterations + 1):
             if self.verbose:
                 print(f"\n--- Iteration {iteration}/{self.max_iterations} ---")
 
             MAX_RETRIES = 10
+            last_error: Optional[Exception] = None
+            forced_tool_choice: Any = "auto"
+            if pending_tool_correction:
+                forced_tool_choice = {"type": "function", "function": {"name": "finish"}}
+            elif iteration == 1 and self._uploaded_image_paths:
+                forced_tool_choice = {"type": "function", "function": {"name": "execute_code"}}
+
             for retry in range(MAX_RETRIES):
                 try:
-                    response = self._call_llm()
+                    response = self._call_llm(tool_choice=forced_tool_choice)
                     break
                 except Exception as e:
-                    self._log("OpenAI API error: %s, retry %d/%d", str(e), retry, MAX_RETRIES, level="error")
+                    last_error = e
+                    self._log("LLM API error: %s, retry %d/%d", str(e), retry, MAX_RETRIES, level="error")
 
-            if retry == MAX_RETRIES - 1:
-                return f"[Error] Failed to call LLM: {e}"
+            if last_error is not None and retry == MAX_RETRIES - 1:
+                return f"[Error] Failed to call LLM: {last_error}"
 
             choice = response.choices[0]
             message = choice.message
@@ -274,12 +289,34 @@ class VLMToolCallAgent:
                     print(f"\n[Assistant] {message.content[:500]}")
 
             if not message.tool_calls:
+                if pending_tool_correction:
+                    self._log("Model stopped again without calling finish tool.", level="error")
+                    return "[Error] Model stopped without calling finish tool."
+
                 if choice.finish_reason == "stop":
-                    self._log("Model stopped without calling finish tool.")
-                    return message.content or "[No response]"
+                    if tool_calls_seen == 0 and self._uploaded_image_paths:
+                        reminder = (
+                            "You must use the available tools. Do not answer directly in plain text. "
+                            "First call `execute_code` to inspect the uploaded image(s)."
+                        )
+                        self.messages.append({"role": "user", "content": reminder})
+                        pending_tool_correction = False
+                        self._log("Model answered without using tools; retrying with an explicit execute_code reminder.", level="warning")
+                        continue
+
+                    reminder = (
+                        "You must return the final answer by calling the `finish` tool. "
+                        "Do not answer in plain text."
+                    )
+                    self.messages.append({"role": "user", "content": reminder})
+                    pending_tool_correction = True
+                    self._log("Model stopped without calling finish tool; retrying with an explicit finish reminder.", level="warning")
+                    continue
                 continue
 
+            pending_tool_correction = False
             for tool_call in message.tool_calls:
+                tool_calls_seen += 1
                 fn_name = tool_call.function.name
                 try:
                     fn_args = json.loads(tool_call.function.arguments)
@@ -310,6 +347,8 @@ class VLMToolCallAgent:
 
                 elif fn_name == "execute_code":
                     code = fn_args.get("code", "")
+                    if self._uploaded_image_paths and not self._code_references_uploaded_files(code):
+                        code = self._inject_uploaded_file_hint(code)
                     text_output = ""
                     image_parts: List[Dict[str, Any]] = []
                     base64_images: List[str] = []
@@ -366,6 +405,29 @@ class VLMToolCallAgent:
 
         self._log("Max iterations reached (%d)", self.max_iterations, level="warning")
         return "[Error] Max iterations reached without a final answer."
+
+    def _code_references_uploaded_files(self, code: str) -> bool:
+        for img_path in self._uploaded_image_paths:
+            basename = os.path.basename(img_path)
+            if basename in code or f"/mnt/data/{basename}" in code:
+                return True
+        return False
+
+    def _inject_uploaded_file_hint(self, code: str) -> str:
+        basenames = [os.path.basename(path) for path in self._uploaded_image_paths]
+        hint_lines = [
+            "# Uploaded file hints injected by the agent.",
+            f"uploaded_files = {json.dumps(basenames)}",
+            "print('Uploaded files:', uploaded_files)",
+        ]
+        if basenames:
+            hint_lines.append(f"image_path = '/mnt/data/{basenames[0]}'")
+        hint = "\n".join(hint_lines)
+
+        # Keep the model's code intact, but prepend a concrete file reference when it omitted one.
+        if re.search(r"^\s*```", code):
+            return code
+        return f"{hint}\n\n{code}"
 
     async def run_interactive(self, image_paths: Optional[List[str]] = None):
         """
