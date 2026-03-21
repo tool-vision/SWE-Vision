@@ -136,10 +136,10 @@ class VLMToolCallAgent:
             tool_choice="auto",
         )
         if self.reasoning:
-            kwargs["extra_body"] = {"reasoning": {"enabled": True, 'effort': 'xhigh'}}
-            kwargs["reasoning_effort"] = 'xhigh'
+            kwargs["extra_body"] = {"reasoning": {"enabled": True, "effort": "high"}}
+            kwargs["reasoning_effort"] = "high"
         else:
-            kwargs["extra_body"] = {"reasoning": {"enabled": False, 'effort': 'minimal'}}
+            kwargs["extra_body"] = {"reasoning": {"enabled": False, "effort": "none"}}
 
         response = self.client.chat.completions.create(**kwargs)
         return response
@@ -229,15 +229,17 @@ class VLMToolCallAgent:
                 print(f"\n--- Iteration {iteration}/{self.max_iterations} ---")
 
             MAX_RETRIES = 10
+            last_error: Optional[Exception] = None
             for retry in range(MAX_RETRIES):
                 try:
                     response = self._call_llm()
                     break
                 except Exception as e:
+                    last_error = e
                     self._log("OpenAI API error: %s, retry %d/%d", str(e), retry, MAX_RETRIES, level="error")
 
-            if retry == MAX_RETRIES - 1:
-                return f"[Error] Failed to call LLM: {e}"
+            if last_error is not None and retry == MAX_RETRIES - 1:
+                return f"[Error] Failed to call LLM: {last_error}"
 
             choice = response.choices[0]
             message = choice.message
